@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# CLI local da devbox-kioshi-devops. Uso: ./devbox-kioshi-devops <deploy|sync|payload|start|stop|status|shell|logs|destroy>
+set -euo pipefail
+
+PROFILE="${DEVBOX_PROFILE:-Kioshi-DevOps}"
+REGION="${DEVBOX_REGION:-us-west-2}"
+STACK="${DEVBOX_STACK:-devbox-kioshi-devops}"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
+
+output() { aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+instance_id() { output InstanceId; }
+
+# Monta o payload com dotfiles do desktop (sem segredos).
+build_payload() {
+  local out="$1" stage
+  stage="$(mktemp -d)"
+  cp -a "$DIR/payload/." "$stage/"
+  local h="$stage/home"
+  mkdir -p "$h/.claude"
+  cp ~/.p10k.zsh "$h/"
+  sed -E 's/^(\s*editor\s*=).*/\1 vim/' ~/.gitconfig > "$h/.gitconfig"
+  cp ~/.claude/statusline.sh "$h/.claude/"
+  # Marketplaces em DEVBOX_EXCLUDE_MARKETPLACES (separados por espaco) nao vao para a instancia.
+  jq --arg ex "${DEVBOX_EXCLUDE_MARKETPLACES:-}" '
+    ($ex | split(" ") | map(select(. != ""))) as $m
+    | .extraKnownMarketplaces |= (. // {} | with_entries(select(.key as $k | $m | index($k) | not)))
+    | .enabledPlugins |= (. // {} | with_entries(select(.key | split("@")[-1] as $k | $m | index($k) | not)))' \
+    ~/.claude/settings.json > "$h/.claude/settings.json"
+  tar -C ~/.claude --exclude='.trash' --exclude='synced' -cf - skills | tar -C "$h/.claude" -xf -
+  [ -f ~/.claude/CLAUDE.md ] && cp ~/.claude/CLAUDE.md "$h/.claude/"
+  tar -C "$stage" -czf "$out" home
+  rm -rf "$stage"
+}
+
+sync() {
+  local bucket tmp
+  bucket="$(output BucketName)"
+  tmp="$(mktemp -d)"
+  build_payload "$tmp/payload.tar.gz"
+  aws s3 cp "$tmp/payload.tar.gz" "s3://$bucket/payload.tar.gz"
+  aws s3 cp "$DIR/bootstrap.sh" "s3://$bucket/bootstrap.sh"
+  rm -rf "$tmp"
+}
+
+case "${1:-}" in
+  deploy)
+    aws cloudformation deploy --stack-name "$STACK" --template-file "$DIR/template.yaml" \
+      --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset "${@:2}"
+    sync
+    echo "Instancia: $(instance_id). Bootstrap leva ~15-20 min (pyenv compila o Python)."
+    echo "Acompanhe com: $0 logs"
+    ;;
+  payload)
+    # Gera o payload localmente para inspecao.
+    build_payload "${2:-devbox-kioshi-devops-payload.tar.gz}"
+    ;;
+  sync)
+    # Atualiza dotfiles no S3 e aplica na instancia (se ligada).
+    sync
+    aws ssm send-command --instance-ids "$(instance_id)" --document-name AWS-RunShellScript \
+      --parameters 'commands=["aws s3 cp s3://'"$(output BucketName)"'/payload.tar.gz /tmp/p.tgz && tar -xzf /tmp/p.tgz -C /tmp && cp -a /tmp/home/. /home/ubuntu/ && chown -R ubuntu:ubuntu /home/ubuntu"]' \
+      --query Command.CommandId --output text
+    ;;
+  start)
+    aws ec2 start-instances --instance-ids "$(instance_id)" --query 'StartingInstances[0].CurrentState.Name' --output text
+    ;;
+  stop)
+    aws ec2 stop-instances --instance-ids "$(instance_id)" --query 'StoppingInstances[0].CurrentState.Name' --output text
+    ;;
+  status)
+    aws ec2 describe-instances --instance-ids "$(instance_id)" \
+      --query 'Reservations[0].Instances[0].{id:InstanceId,state:State.Name,type:InstanceType,ip:PublicIpAddress}' --output table
+    ;;
+  shell)
+    # Requer o Session Manager plugin: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
+    aws ssm start-session --target "$(instance_id)" --document-name AWS-StartInteractiveCommand \
+      --parameters command="sudo -iu ubuntu"
+    ;;
+  logs)
+    aws ssm start-session --target "$(instance_id)" --document-name AWS-StartInteractiveCommand \
+      --parameters command="sudo tail -n 50 -f /var/log/devbox-kioshi-devops-bootstrap.log"
+    ;;
+  destroy)
+    read -rp "Apagar a stack '$STACK' e o disco da devbox-kioshi-devops? [digite o nome da stack] " ans
+    [ "$ans" = "$STACK" ] || { echo "Cancelado."; exit 1; }
+    aws s3 rm "s3://$(output BucketName)" --recursive
+    aws cloudformation delete-stack --stack-name "$STACK"
+    ;;
+  *)
+    echo "Uso: $0 <deploy|sync|payload|start|stop|status|shell|logs|destroy>"; exit 1 ;;
+esac

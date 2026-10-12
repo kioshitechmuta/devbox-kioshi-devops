@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Setup unico apos o primeiro boot: login no GitHub e no Claude, clone dos repos e ativa o Remote Control.
+# Rode como ubuntu:  devbox-kioshi-devops-setup-auth
+set -euo pipefail
+source "$HOME/.devbox-kioshi-devops/env.sh"
+
+echo "==> 1/4 GitHub (device code: abra o link no celular e digite o codigo)"
+gh auth status >/dev/null 2>&1 || gh auth login -h github.com -p https -w -s repo,read:org,gist,workflow
+gh auth setup-git
+
+echo "==> 2/4 Repositorios"
+while read -r repo dest; do
+  [ -z "$repo" ] && continue
+  dest="${dest/#\~/$HOME}"
+  [ -d "$dest/.git" ] || { mkdir -p "$(dirname "$dest")"; gh repo clone "$repo" "$dest"; }
+done < "$HOME/.devbox-kioshi-devops/repos.txt"
+
+echo "==> 3/4 MCP aws-mcp"
+claude mcp get aws-mcp >/dev/null 2>&1 || claude mcp add -s user aws-mcp -- \
+  uvx mcp-proxy-for-aws@latest https://aws-mcp.us-east-1.api.aws/mcp --metadata INSTALL_SOURCE=aws-cli
+
+echo "==> 4/4 Claude Code: faca /login, aceite o trust da pasta ~/github e saia com /exit"
+cd "$HOME/github"
+# /exit pode sair com status != 0; nao deixa o set -e abortar antes de habilitar o servico.
+[ -f "$HOME/.claude/.credentials.json" ] || claude || true
+sudo systemctl enable --now claude-rc
+sudo systemctl restart claude-rc
+echo "Pronto. A sessao 'devbox-kioshi-devops' deve aparecer em claude.ai/code e no app Claude (Code)."
+echo "Logs: tmux attach -t claude-rc   (sair: Ctrl-b d)"

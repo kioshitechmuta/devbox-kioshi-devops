@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Mantem `claude remote-control` rodando (executado dentro do tmux "claude-rc" pelo systemd).
+source "$HOME/.devbox-kioshi-devops/env.sh"
+set -a; source "$HOME/.devbox-kioshi-devops/rc.env"; set +a
+cd "$DEVBOX_RC_DIR"
+until [ -f "$HOME/.claude/.credentials.json" ]; do
+  echo "Aguardando login do Claude (rode devbox-kioshi-devops-setup-auth)..."; sleep 30
+done
+while true; do
+  # No boot o servico sobe antes da rede/DNS; sem isso a sessao pre-criada falha.
+  until curl -s -o /dev/null --max-time 5 https://api.anthropic.com; do
+    echo "Aguardando rede..."; sleep 3
+  done
+  # Depois de stop/start a sessao registrada aqui ja nao existe (404 ao reanexar); comeca sempre uma nova.
+  rm -f "$HOME/.claude/projects/$(pwd | tr '/' '-')/bridge-pointer.json"
+  # Registros de sessoes cujo processo morreu (ex.: stop da instancia) travam com "already served".
+  for f in "$HOME"/.claude/sessions/*.json; do
+    [ -f "$f" ] || continue
+    pid="$(basename "$f" .json)"
+    kill -0 "$pid" 2>/dev/null || rm -f "$HOME/.claude/sessions/$pid".*
+  done
+  claude remote-control \
+    --name "$DEVBOX_RC_NAME" \
+    --spawn "$DEVBOX_RC_SPAWN" \
+    --permission-mode "$DEVBOX_RC_PERMISSION_MODE"
+  echo "claude remote-control saiu (status $?); reiniciando em 15s..."
+  sleep 15
+done
