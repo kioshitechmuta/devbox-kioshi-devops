@@ -1,0 +1,23 @@
+{
+  "prefix": "devbox-kioshi-devops",
+  "defaults": {
+    "instanceType": "t4g.medium",
+    "volumeGiB": 50,
+    "managedPolicy": "AdministratorAccess",
+    "ubuntuAmi": { "us-west-2": "ami-0b490e33b2131d8b9" }
+  },
+  "projects": [
+    {
+      "name": "laski-finances",
+      "repos": [
+        { "repo": "LaskiTech/laski-finances-serverless", "dir": "~/github/laski/laski-finances-serverless" }
+      ]
+    },
+    {
+      "name": "asa-bank",
+      "repos": [
+        { "repo": "LaskiTech/asa-bank-challenge", "dir": "~/github/laski/asa-bank-challenge" }
+      ]
+    }
+  ]
+}

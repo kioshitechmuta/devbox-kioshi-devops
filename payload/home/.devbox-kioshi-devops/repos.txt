@@ -1,1 +1,0 @@
-LaskiTech/laski-finances-serverless ~/github/laski/laski-finances-serverless

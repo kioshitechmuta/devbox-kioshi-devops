@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Bootstrap da devbox-kioshi-devops (roda como root no primeiro boot, via user-data).
+# Bootstrap de uma devbox de projeto (roda como root no primeiro boot, via user-data).
 # Replica o ambiente do desktop: zsh + oh-my-zsh + p10k, nvm/Node, pyenv/Python, uv,
 # AWS CLI, gh, Docker, Terraform, CDK, Java e Claude Code com Remote Control.
 set -euxo pipefail
 exec > >(tee -a /var/log/devbox-kioshi-devops-bootstrap.log) 2>&1
 
-: "${DEVBOX_BUCKET:?}" "${DEVBOX_REGION:?}"
+: "${DEVBOX_BUCKET:?}" "${DEVBOX_REGION:?}" "${DEVBOX_PROJECT:?}" "${DEVBOX_NAME:?}"
 export DEBIAN_FRONTEND=noninteractive
 USERNAME=ubuntu
 USER_HOME=/home/$USERNAME
@@ -46,10 +46,10 @@ rm -rf /tmp/aws && unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install --update
 usermod -aG docker "$USERNAME"
 chsh -s /usr/bin/zsh "$USERNAME"
 systemctl enable --now docker
-hostnamectl set-hostname devbox-kioshi-devops
+hostnamectl set-hostname "$DEVBOX_NAME"
 
-# --- Payload (dotfiles e scripts) enviado pelo desktop ------------------------------------
-aws s3 cp "s3://${DEVBOX_BUCKET}/payload.tar.gz" /tmp/payload.tar.gz --region "$DEVBOX_REGION"
+# --- Payload (dotfiles, scripts, repos e rc.env do projeto) enviado pelo desktop ----------
+aws s3 cp "s3://${DEVBOX_BUCKET}/projects/${DEVBOX_PROJECT}/payload.tar.gz" /tmp/payload.tar.gz --region "$DEVBOX_REGION"
 mkdir -p /tmp/payload && tar -xzf /tmp/payload.tar.gz -C /tmp/payload
 
 # --- Ambiente do usuario ------------------------------------------------------------------
