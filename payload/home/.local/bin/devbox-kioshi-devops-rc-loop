@@ -2,10 +2,11 @@
 # Mantem `claude remote-control` rodando (executado dentro do tmux "claude-rc" pelo systemd).
 source "$HOME/.devbox-kioshi-devops/env.sh"
 set -a; source "$HOME/.devbox-kioshi-devops/rc.env"; set +a
-cd "$DEVBOX_RC_DIR"
-until [ -f "$HOME/.claude/.credentials.json" ]; do
-  echo "Aguardando login do Claude (rode devbox-kioshi-devops-setup-auth)..."; sleep 30
+# A pasta do projeto so existe depois que o setup-auth clona os repos.
+until [ -f "$HOME/.claude/.credentials.json" ] && [ -d "$DEVBOX_RC_DIR" ]; do
+  echo "Aguardando login do Claude e clone dos repos (rode devbox-kioshi-devops-setup-auth)..."; sleep 30
 done
+cd "$DEVBOX_RC_DIR"
 while true; do
   # No boot o servico sobe antes da rede/DNS; sem isso a sessao pre-criada falha.
   until curl -s -o /dev/null --max-time 5 https://api.anthropic.com; do

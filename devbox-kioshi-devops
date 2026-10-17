@@ -1,19 +1,41 @@
 #!/usr/bin/env bash
-# CLI local da devbox-kioshi-devops. Uso: ./devbox-kioshi-devops <deploy|sync|payload|start|stop|status|shell|logs|destroy>
+# CLI local das devboxes (uma instancia EC2 por projeto de projects.json).
+# Uso: ./devbox-kioshi-devops <deploy|diff|sync|payload|start|stop|status|shell|logs|destroy> [projeto]
 set -euo pipefail
 
 PROFILE="${DEVBOX_PROFILE:-Kioshi-DevOps}"
 REGION="${DEVBOX_REGION:-us-west-2}"
-STACK="${DEVBOX_STACK:-devbox-kioshi-devops}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="$DIR/projects.json"
+PREFIX="$(jq -r .prefix "$CONFIG")"
+SHARED_STACK="$PREFIX-shared"
+CMD="${1:-}"
+P="${2:-}"
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
+# CDK fixado no package.json; AWS_REGION vira o CDK_DEFAULT_REGION das stacks.
+cdk() {
+  [ -d "$DIR/node_modules" ] || npm --prefix "$DIR" ci
+  (cd "$DIR" && AWS_REGION="$REGION" npx cdk --profile "$PROFILE" "$@")
+}
 
-output() { aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
-instance_id() { output InstanceId; }
+usage() {
+  echo "Uso: $0 <deploy|diff|sync|payload|start|stop|status|shell|logs|destroy> [projeto]"
+  echo "Projetos: $(jq -r '[.projects[].name] | join(", ")' "$CONFIG")"
+  exit 1
+}
+project_json() { jq -e --arg p "$1" '.projects[] | select(.name == $p)' "$CONFIG"; }
+need_project() {
+  [ -n "$P" ] || usage
+  project_json "$P" >/dev/null || { echo "Projeto '$P' nao existe em projects.json."; usage; }
+}
 
-# Monta o payload com dotfiles do desktop (sem segredos).
+output() { aws cloudformation describe-stacks --stack-name "$1" --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text; }
+bucket() { output "$SHARED_STACK" BucketName; }
+instance_id() { output "$PREFIX-$1" InstanceId; }
+
+# Monta o payload do projeto com dotfiles do desktop (sem segredos).
 build_payload() {
-  local out="$1" stage
+  local p="$1" out="$2" stage rc_dir
   stage="$(mktemp -d)"
   cp -a "$DIR/payload/." "$stage/"
   local h="$stage/home"
@@ -29,64 +51,103 @@ build_payload() {
     ~/.claude/settings.json > "$h/.claude/settings.json"
   tar -C ~/.claude --exclude='.trash' --exclude='synced' -cf - skills | tar -C "$h/.claude" -xf -
   [ -f ~/.claude/CLAUDE.md ] && cp ~/.claude/CLAUDE.md "$h/.claude/"
+  # Remote Control e repos do projeto: sessao <prefix>-<projeto> aberta em rcDir (ou no 1o repo).
+  rc_dir="$(project_json "$p" | jq -r '.rcDir // .repos[0].dir // "~/github"')"
+  sed -i -E "s|^DEVBOX_RC_NAME=.*|DEVBOX_RC_NAME=$PREFIX-$p|; s|^DEVBOX_RC_DIR=.*|DEVBOX_RC_DIR=${rc_dir/#\~/\$HOME}|" \
+    "$h/.devbox-kioshi-devops/rc.env"
+  project_json "$p" | jq -r '.repos[]? | "\(.repo) \(.dir)"' > "$h/.devbox-kioshi-devops/repos.txt"
   tar -C "$stage" -czf "$out" home
   rm -rf "$stage"
 }
 
-sync() {
-  local bucket tmp
-  bucket="$(output BucketName)"
+upload() {
+  local p="$1" b tmp
+  b="$(bucket)"
   tmp="$(mktemp -d)"
-  build_payload "$tmp/payload.tar.gz"
-  aws s3 cp "$tmp/payload.tar.gz" "s3://$bucket/payload.tar.gz"
-  aws s3 cp "$DIR/bootstrap.sh" "s3://$bucket/bootstrap.sh"
+  build_payload "$p" "$tmp/payload.tar.gz"
+  aws s3 cp "$DIR/bootstrap.sh" "s3://$b/bootstrap.sh"
+  aws s3 cp "$tmp/payload.tar.gz" "s3://$b/projects/$p/payload.tar.gz"
   rm -rf "$tmp"
 }
 
-case "${1:-}" in
+case "$CMD" in
   deploy)
-    aws cloudformation deploy --stack-name "$STACK" --template-file "$DIR/template.yaml" \
-      --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset "${@:2}"
-    sync
-    echo "Instancia: $(instance_id). Bootstrap leva ~15-20 min (pyenv compila o Python)."
-    echo "Acompanhe com: $0 logs"
+    # Shared primeiro (bucket), depois o payload, e so entao a instancia: o user-data ja encontra tudo no S3.
+    need_project
+    cdk deploy "$SHARED_STACK" "${@:3}"
+    upload "$P"
+    cdk deploy --exclusively "$PREFIX-$P" "${@:3}"
+    echo "Instancia: $(instance_id "$P"). Bootstrap leva ~15-20 min (pyenv compila o Python)."
+    echo "Acompanhe com: $0 logs $P"
+    ;;
+  diff)
+    # Rode antes de deploy: "requires replacement" na Instance = disco apagado.
+    need_project
+    cdk diff "$SHARED_STACK" "$PREFIX-$P" "${@:3}"
     ;;
   payload)
     # Gera o payload localmente para inspecao.
-    build_payload "${2:-devbox-kioshi-devops-payload.tar.gz}"
+    need_project
+    build_payload "$P" "${3:-$PREFIX-$P-payload.tar.gz}"
     ;;
   sync)
     # Atualiza dotfiles no S3 e aplica na instancia (se ligada).
-    sync
-    aws ssm send-command --instance-ids "$(instance_id)" --document-name AWS-RunShellScript \
-      --parameters 'commands=["aws s3 cp s3://'"$(output BucketName)"'/payload.tar.gz /tmp/p.tgz && tar -xzf /tmp/p.tgz -C /tmp && cp -a /tmp/home/. /home/ubuntu/ && chown -R ubuntu:ubuntu /home/ubuntu"]' \
+    need_project
+    upload "$P"
+    aws ssm send-command --instance-ids "$(instance_id "$P")" --document-name AWS-RunShellScript \
+      --parameters 'commands=["aws s3 cp s3://'"$(bucket)"'/projects/'"$P"'/payload.tar.gz /tmp/p.tgz && tar -xzf /tmp/p.tgz -C /tmp && cp -a /tmp/home/. /home/ubuntu/ && chown -R ubuntu:ubuntu /home/ubuntu"]' \
       --query Command.CommandId --output text
     ;;
   start)
-    aws ec2 start-instances --instance-ids "$(instance_id)" --query 'StartingInstances[0].CurrentState.Name' --output text
+    need_project
+    aws ec2 start-instances --instance-ids "$(instance_id "$P")" --query 'StartingInstances[0].CurrentState.Name' --output text
     ;;
   stop)
-    aws ec2 stop-instances --instance-ids "$(instance_id)" --query 'StoppingInstances[0].CurrentState.Name' --output text
+    need_project
+    aws ec2 stop-instances --instance-ids "$(instance_id "$P")" --query 'StoppingInstances[0].CurrentState.Name' --output text
     ;;
   status)
-    aws ec2 describe-instances --instance-ids "$(instance_id)" \
-      --query 'Reservations[0].Instances[0].{id:InstanceId,state:State.Name,type:InstanceType,ip:PublicIpAddress}' --output table
+    # Sem projeto: todas as devboxes da conta/regiao.
+    if [ -n "$P" ]; then
+      need_project
+      sel=(--instance-ids "$(instance_id "$P")")
+    else
+      sel=(--filters Name=tag-key,Values=devbox:project Name=instance-state-name,Values=pending,running,stopping,stopped)
+    fi
+    aws ec2 describe-instances "${sel[@]}" \
+      --query 'Reservations[].Instances[].{project:Tags[?Key==`devbox:project`]|[0].Value,id:InstanceId,state:State.Name,type:InstanceType,ip:PublicIpAddress}' --output table
     ;;
   shell)
     # Requer o Session Manager plugin: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
-    aws ssm start-session --target "$(instance_id)" --document-name AWS-StartInteractiveCommand \
+    need_project
+    aws ssm start-session --target "$(instance_id "$P")" --document-name AWS-StartInteractiveCommand \
       --parameters command="sudo -iu ubuntu"
     ;;
   logs)
-    aws ssm start-session --target "$(instance_id)" --document-name AWS-StartInteractiveCommand \
+    need_project
+    aws ssm start-session --target "$(instance_id "$P")" --document-name AWS-StartInteractiveCommand \
       --parameters command="sudo tail -n 50 -f /var/log/devbox-kioshi-devops-bootstrap.log"
     ;;
   destroy)
-    read -rp "Apagar a stack '$STACK' e o disco da devbox-kioshi-devops? [digite o nome da stack] " ans
-    [ "$ans" = "$STACK" ] || { echo "Cancelado."; exit 1; }
-    aws s3 rm "s3://$(output BucketName)" --recursive
-    aws cloudformation delete-stack --stack-name "$STACK"
+    # `destroy shared` apaga VPC/bucket; so permitido depois de destruir todas as devboxes.
+    [ -n "$P" ] || usage
+    if [ "$P" = shared ]; then
+      stack="$SHARED_STACK"
+      for p in $(jq -r '.projects[].name' "$CONFIG"); do
+        if aws cloudformation describe-stacks --stack-name "$PREFIX-$p" >/dev/null 2>&1; then
+          echo "A devbox '$p' ainda existe; rode '$0 destroy $p' antes."; exit 1
+        fi
+      done
+    else
+      need_project
+      stack="$PREFIX-$P"
+    fi
+    read -rp "Apagar a stack '$stack'$([ "$P" = shared ] || echo ' e o disco da devbox')? [digite o nome da stack] " ans
+    [ "$ans" = "$stack" ] || { echo "Cancelado."; exit 1; }
+    [ "$P" = shared ] || aws s3 rm "s3://$(bucket)/projects/$P" --recursive
+    # --exclusively: sem isso o cdk tambem apaga as stacks que dependem desta.
+    cdk destroy --exclusively --force "$stack"
     ;;
   *)
-    echo "Uso: $0 <deploy|sync|payload|start|stop|status|shell|logs|destroy>"; exit 1 ;;
+    usage ;;
 esac

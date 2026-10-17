@@ -1,2 +1,6 @@
-devbox-kioshi-devops-payload.tar.gz
+*-payload.tar.gz
 *.tgz
+node_modules
+cdk.out
+.cdk.staging
+cdk.context.json
